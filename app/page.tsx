@@ -1,10 +1,49 @@
 'use client'
 
-import { Canvas } from '@react-three/fiber'
+import { Canvas, useThree } from '@react-three/fiber'
 import { PointerLockControls, Sky } from '@react-three/drei'
 import { useRef, useState, useEffect } from 'react'
 import * as THREE from 'three'
 import { useFrame } from '@react-three/fiber'
+
+// Bullet component
+function Bullet({ id, startPosition, direction, onRemove, onHitEnemy }: any) {
+  const meshRef = useRef<THREE.Mesh>(null)
+  const position = useRef(new THREE.Vector3(...startPosition))
+  const velocity = useRef(new THREE.Vector3(...direction).multiplyScalar(50))
+  const lifetime = useRef(0)
+
+  useFrame((state, delta) => {
+    if (!meshRef.current) return
+
+    // Update position
+    position.current.addScaledVector(velocity.current, delta)
+    meshRef.current.position.copy(position.current)
+
+    // Add trail effect with slight glow
+    lifetime.current += delta
+
+    // Remove bullet after 3 seconds or if too far
+    if (lifetime.current > 3 || position.current.length() > 100) {
+      onRemove(id)
+    }
+
+    // Check collision with enemies (handled by parent)
+  })
+
+  return (
+    <mesh ref={meshRef} position={startPosition}>
+      <sphereGeometry args={[0.1, 8, 8]} />
+      <meshStandardMaterial 
+        color="#ffff00" 
+        emissive="#ffaa00"
+        emissiveIntensity={2}
+      />
+      {/* Trail effect */}
+      <pointLight color="#ffaa00" intensity={1} distance={2} />
+    </mesh>
+  )
+}
 
 // Player component
 function Player({ position, onShoot }: any) {
@@ -80,7 +119,7 @@ function Player({ position, onShoot }: any) {
 }
 
 // Enemy component
-function Enemy({ position, id, onHit }: any) {
+function Enemy({ position, id, onHit, bullets }: any) {
   const meshRef = useRef<THREE.Mesh>(null)
   const [health, setHealth] = useState(100)
 
@@ -90,9 +129,28 @@ function Enemy({ position, id, onHit }: any) {
     }
   }, [health, id, onHit])
 
+  // Check bullet collisions
+  useFrame(() => {
+    if (!meshRef.current || health <= 0) return
+
+    const enemyPos = new THREE.Vector3(...position)
+    
+    bullets.forEach((bullet: any) => {
+      const bulletPos = new THREE.Vector3(...bullet.position)
+      const distance = enemyPos.distanceTo(bulletPos)
+      
+      // Hit detection
+      if (distance < 1.5 && !bullet.hasHit) {
+        bullet.hasHit = true
+        setHealth((h) => Math.max(0, h - 50))
+        bullet.onRemove(bullet.id)
+      }
+    })
+  })
+
   const handleClick = (e: any) => {
     e.stopPropagation()
-    setHealth((h) => h - 50)
+    setHealth((h) => Math.max(0, h - 50))
   }
 
   if (health <= 0) return null
@@ -101,6 +159,11 @@ function Enemy({ position, id, onHit }: any) {
     <mesh ref={meshRef} position={position} onClick={handleClick}>
       <boxGeometry args={[1, 2, 1]} />
       <meshStandardMaterial color={health > 50 ? "red" : "darkred"} />
+      {/* Health bar */}
+      <mesh position={[0, 1.5, 0]}>
+        <planeGeometry args={[1, 0.1]} />
+        <meshBasicMaterial color="green" opacity={health / 100} transparent />
+      </mesh>
     </mesh>
   )
 }
@@ -145,8 +208,59 @@ function Crosshair() {
       <div className="relative w-8 h-8">
         <div className="absolute top-1/2 left-0 w-full h-0.5 bg-white transform -translate-y-1/2" />
         <div className="absolute left-1/2 top-0 h-full w-0.5 bg-white transform -translate-x-1/2" />
+        <div className="absolute top-1/2 left-1/2 w-1 h-1 bg-red-500 rounded-full transform -translate-x-1/2 -translate-y-1/2" />
       </div>
     </div>
+  )
+}
+
+// Camera Hook to get camera info
+function useCameraInfo() {
+  const { camera } = useThree()
+  return camera
+}
+
+// Game Scene Component
+function GameScene({ bullets, onRemoveBullet, enemies, onEnemyHit, onShoot }: any) {
+  return (
+    <>
+      <Sky sunPosition={[100, 20, 100]} />
+      <ambientLight intensity={0.5} />
+      <directionalLight
+        position={[10, 10, 5]}
+        intensity={1}
+        castShadow
+        shadow-mapSize-width={2048}
+        shadow-mapSize-height={2048}
+      />
+      
+      <Player position={[0, 0, 0]} onShoot={onShoot} />
+      <Ground />
+      <Buildings />
+      
+      {/* Render all bullets */}
+      {bullets.map((bullet: any) => (
+        <Bullet
+          key={bullet.id}
+          id={bullet.id}
+          startPosition={bullet.position}
+          direction={bullet.direction}
+          onRemove={onRemoveBullet}
+          onHitEnemy={() => {}}
+        />
+      ))}
+      
+      {/* Render all enemies */}
+      {enemies.map((enemy: any) => (
+        <Enemy
+          key={enemy.id}
+          id={enemy.id}
+          position={enemy.position}
+          onHit={onEnemyHit}
+          bullets={bullets}
+        />
+      ))}
+    </>
   )
 }
 
@@ -156,8 +270,11 @@ export default function Game() {
   const [ammo, setAmmo] = useState(30)
   const [health, setHealth] = useState(100)
   const [enemies, setEnemies] = useState<any[]>([])
+  const [bullets, setBullets] = useState<any[]>([])
   const [isLocked, setIsLocked] = useState(false)
   const nextEnemyId = useRef(0)
+  const nextBulletId = useRef(0)
+  const cameraRef = useRef<THREE.Camera | null>(null)
 
   useEffect(() => {
     // Spawn initial enemies
@@ -189,8 +306,29 @@ export default function Game() {
   }, [])
 
   const handleShoot = () => {
-    if (ammo > 0 && isLocked) {
+    if (ammo > 0 && isLocked && cameraRef.current) {
       setAmmo((a) => a - 1)
+      
+      // Get camera position and direction
+      const camera = cameraRef.current
+      const direction = new THREE.Vector3()
+      camera.getWorldDirection(direction)
+      
+      const position = camera.position.clone()
+      
+      // Create bullet
+      const newBullet = {
+        id: nextBulletId.current++,
+        position: [position.x, position.y, position.z],
+        direction: [direction.x, direction.y, direction.z],
+        hasHit: false,
+        onRemove: (id: number) => {
+          setBullets((prev) => prev.filter((b) => b.id !== id))
+        }
+      }
+      
+      setBullets((prev) => [...prev, newBullet])
+      
       // Reload after empty
       if (ammo - 1 === 0) {
         setTimeout(() => setAmmo(30), 1500)
@@ -201,6 +339,10 @@ export default function Game() {
   const handleEnemyHit = (id: number) => {
     setEnemies((prev) => prev.filter((e) => e.id !== id))
     setScore((s) => s + 100)
+  }
+
+  const handleRemoveBullet = (id: number) => {
+    setBullets((prev) => prev.filter((b) => b.id !== id))
   }
 
   return (
@@ -249,29 +391,17 @@ export default function Game() {
       <Canvas
         camera={{ position: [0, 1.6, 5], fov: 75 }}
         shadows
+        onCreated={({ camera }) => {
+          cameraRef.current = camera
+        }}
       >
-        <Sky sunPosition={[100, 20, 100]} />
-        <ambientLight intensity={0.5} />
-        <directionalLight
-          position={[10, 10, 5]}
-          intensity={1}
-          castShadow
-          shadow-mapSize-width={2048}
-          shadow-mapSize-height={2048}
+        <GameScene 
+          bullets={bullets}
+          onRemoveBullet={handleRemoveBullet}
+          enemies={enemies}
+          onEnemyHit={handleEnemyHit}
+          onShoot={handleShoot}
         />
-        
-        <Player position={[0, 0, 0]} onShoot={handleShoot} />
-        <Ground />
-        <Buildings />
-        
-        {enemies.map((enemy) => (
-          <Enemy
-            key={enemy.id}
-            id={enemy.id}
-            position={enemy.position}
-            onHit={handleEnemyHit}
-          />
-        ))}
 
         <PointerLockControls
           onLock={() => setIsLocked(true)}
